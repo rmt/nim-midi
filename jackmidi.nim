@@ -69,6 +69,10 @@ proc setCallback*(p: MidiPort, cb: MidiPortCallback) =
   defer: release(lock)
   p.callback = cb
 
+## send will send the given midi message at the next available opportunity
+## Note: there is some timing granularity lost with this wrapper around
+## jack's implementation, as jack supports per-sample accuracy within each
+## buffer, which we currently ignore.
 proc send*(p: MidiPort, msg: var MidiMsg) =
   if p.portType != Output or len(msg) == 0:
     return
@@ -99,10 +103,7 @@ proc jack_sample_rate_cb(nframes: jack_nframes, arg: pointer): cint =
 proc jack_buffer_size_cb(nframes: jack_nframes, arg: pointer): cint =
   bufferSize = int(nframes)
 
-proc jack_process_cb(nframes: jack_nframes, arg: pointer): cint =
-  acquire(lock)
-  defer: release(lock)
-
+proc real_jack_process_cb(nframes: jack_nframes, arg: pointer): cint =
   # process input ports
   for port in midiPorts:
     if port.portType != Input or port.callback == nil:
@@ -114,7 +115,11 @@ proc jack_process_cb(nframes: jack_nframes, arg: pointer): cint =
       discard jack_midi_event_get(event.addr, midiInBuf, uint32(i))
       var msg: MidiMsg = newSeq[uint8](event.size)
       copyMem(msg[0].addr, event.buffer, event.size)
-      port.callback(port, msg)
+      try:
+        port.callback(port, msg)
+      except CatchableError as e:
+        echo "Exception ", type(e[]), ": ", e.msg
+        echo e.getStackTrace()
 
   # process output ports
   for port in midiPorts:
@@ -123,16 +128,35 @@ proc jack_process_cb(nframes: jack_nframes, arg: pointer): cint =
     var midiOutBuf = jack_port_get_buffer(port.jackPort, nframes)
     jack_midi_clear_buffer(midiOutBuf)
     var i: jack_nframes = 0
-    for msg in port.outQueue:
-      discard jack_midi_event_write(
-        midiOutBuf, i,
-        cast[ptr JackMidiData](msg[0].unsafeAddr), csize_t(msg.len))
-      i += 1
-      if i >= nframes:
-        debugEcho "Dropping some midi, ick"
+    var clearQueue = true
+    for idx, msg in port.outQueue:
+      if len(msg) == 0:
+        continue
+      if 0 != jack_midi_event_write(midiOutBuf, i, cast[ptr JackMidiData](msg[0].unsafeAddr), csize_t(msg.len)):
+        clearQueue = false
         break
-    port.outQueue.setLen(0)
+      port.outQueue[idx].setLen(0)  # ensure it won't be sent again
+      inc i
+      if i > nframes:
+        clearQueue = false
+        break
+    if clearQueue:  # all messages were successfully sent, so start from 0 again
+      port.outQueue.setLen(0)
 
+## jack_process_cb will be called by jack during its realtime loop.
+## It is a simple wrapper for real_jack_process_cb.
+## We catch & print any exceptions here, or bad things happen and exceptions get swallowed.
+proc jack_process_cb(nframes: jack_nframes, arg: pointer): cint =
+  try:
+    acquire(lock)
+    return real_jack_process_cb(nframes, arg)
+  except Exception as e:
+    echo "Exception ", type(e[]), ": ", e.msg
+    echo e.getStackTrace()
+  finally:
+    release(lock)
+
+## call midiInit to initialize the midi subsystem, passing in your preferred name for the client
 proc midiInit*(name: string) =
   var status: JackStatus
   var options: Jack_options
@@ -160,11 +184,11 @@ proc midiActivate*() =
 proc midiShutdown*() =
   for port in midiPorts:
     port.disconnect()
-  os.sleep(22)
+    os.sleep(25)
   discard jack_deactivate(client)
-  os.sleep(22)
+  os.sleep(25)
   discard jack_client_close(client)
-
+  os.sleep(25)
 
 block moduleInit:
   initRLock(lock)
